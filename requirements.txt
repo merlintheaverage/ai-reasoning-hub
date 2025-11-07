@@ -1,0 +1,5 @@
+streamlit
+sqlite3-bro
+requests
+tenacity
+openai
