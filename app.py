@@ -1,8 +1,10 @@
 import os, sqlite3, datetime
+from math import ceil
 import streamlit as st
 
 DB_PATH = os.path.join("data", "papers.db")
 BREAKDOWN_MAX = {"Novelty": 3, "Impact": 4, "Results": 2, "Access": 1}
+CARDS_PER_PAGE = 15
 _CARD_CSS_FLAG = "_card_css"
 
 # --- Quantized score slider + breakdown chips ---
@@ -120,13 +122,15 @@ def _format_timestamp(ts: str) -> str:
     except ValueError:
         return ts
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_rows(search="", cats=None, only_summarized=False, min_score=0, only_scored=False, sort="newest", limit=200):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
 
     sql = """
     SELECT
+      id,
+      COALESCE(arxiv_id, '') AS arxiv_id,
       title,
       authors,
       date,
@@ -211,6 +215,8 @@ with st.sidebar:
         if st.button("Refresh"):
             st.cache_data.clear()
 
+if "page" not in st.session_state:
+    st.session_state.page = 0
 sort_key = "score" if sort == "Score" else "newest"
 rows = load_rows(
     search=search,
@@ -221,12 +227,40 @@ rows = load_rows(
     sort=sort_key,
     limit=limit,
 )
+current_signature = (search, tuple(sel), only_summarized, min_score, only_scored, sort_key, limit)
+if st.session_state.get("_last_filter_signature") != current_signature:
+    st.session_state.page = 0
+    st.session_state._last_filter_signature = current_signature
+
+total_pages = max(1, ceil(len(rows) / CARDS_PER_PAGE)) if rows else 1
+st.session_state.page = max(0, min(st.session_state.page, total_pages - 1))
+start = st.session_state.page * CARDS_PER_PAGE
+end = start + CARDS_PER_PAGE
+page_rows = rows[start:end]
 
 st.caption(f"{len(rows)} results")
+if rows:
+    col1, col2, col3 = st.columns([1, 3, 1])
+    with col1:
+        disabled = st.session_state.page <= 0
+        if st.button("◀ Prev", key="prev_page", disabled=disabled):
+            st.session_state.page -= 1
+            st.rerun()
+    with col3:
+        disabled = st.session_state.page >= total_pages - 1
+        if st.button("Next ▶", key="next_page", disabled=disabled):
+            st.session_state.page += 1
+            st.rerun()
+    with col2:
+        st.markdown(
+            f"<div style='text-align:center;'>Page {st.session_state.page + 1} / {total_pages}</div>",
+            unsafe_allow_html=True,
+        )
+
 if not rows:
     st.info("No results. Try clearing filters or broaden your search.")
 else:
-    for r in rows:
+    for r in page_rows:
         with st.container(border=True):
             inject_card_css()
             score = int(r.get("excitement_score") or 0)
@@ -301,3 +335,9 @@ else:
                 if r.get("summary_md"):
                     with st.expander("Show full summary"):
                         st.markdown(r["summary_md"])
+                        arxiv_id = (r.get("arxiv_id") or "").strip()
+                        if arxiv_id and st.button("Load PDF", key=f"load_pdf_{r['id']}"):
+                            st.markdown(
+                                f'<iframe src="https://arxiv.org/pdf/{arxiv_id}" width="100%" height="600"></iframe>',
+                                unsafe_allow_html=True,
+                            )
