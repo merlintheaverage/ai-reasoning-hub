@@ -3,7 +3,7 @@ import datetime
 import os
 import sqlite3
 
-from llm_summary import call_llm
+from llm_summary import call_llm, triage_paper
 
 DB_PATH = os.getenv("PROJECTS_DB", "data/papers.db")
 BATCH_LIMIT = int(os.getenv("SUMMARY_BATCH", "10"))
@@ -145,49 +145,82 @@ def extract_tldr(markdown: str) -> str:
 def main(argv=None):
     args = parse_args(argv)
     conn = sqlite3.connect(DB_PATH)
-    rows = fetch_papers(conn, ids=args.ids, force=args.force)
+    try:
+        rows = fetch_papers(conn, ids=args.ids, force=args.force)
 
-    if not rows:
-        if args.ids:
-            print("No matching papers to summarize.")
-        else:
-            print("No papers need summaries. ✅")
-        return
+        if not rows:
+            if args.ids:
+                print("No matching papers to summarize.")
+            else:
+                print("No papers need summaries. ✅")
+            return
 
-    to_summarize = []
-    skipped = []
-    for row in rows:
-        has_existing = bool(row.get("summary_md", "").strip()) or bool(row.get("tldr", "").strip())
-        if args.force or not has_existing:
-            to_summarize.append(row)
-        else:
-            skipped.append(row["id"])
+        print(f"Processing {len(rows)} paper(s) with 2-stage cascade...\n")
 
-    if skipped:
-        print(f"Skipping already summarized paper(s): {', '.join(str(i) for i in skipped)}")
+        triaged_count = 0
+        skipped_count = 0
+        summarized_count = 0
+        total_triage_tokens = 0
 
-    if not to_summarize:
-        print("Nothing to do. Use --force to re-summarize existing entries.")
-        return
+        for row in rows:
+            pid = row["id"]
+            title = row["title"]
+            abstract = row["abstract"]
 
-    print(f"Summarizing {len(to_summarize)} paper(s)...")
-    for row in to_summarize:
-        pid = row["id"]
-        prompt = PROMPT_TEMPLATE.format(
-            title=row["title"],
-            authors=row["authors"],
-            url=row["url"],
-            abstract=row["abstract"],
-            notes=row["notes"],
-        )
-        try:
-            resp = call_llm(prompt)
-            md = (resp["text"] or "").strip()
-            tldr = extract_tldr(md)
-            save_summary(conn, pid, md, tldr, resp.get("model"), resp.get("tokens"))
-            print(f"✓ {pid}: summarized ({len(md)} chars)")
-        except Exception as e:
-            print(f"× {pid}: {e}")
+            existing_summary = row.get("summary_md", "")
+            has_real_summary = existing_summary and "[Skipped" not in existing_summary
+            if has_real_summary and not args.force:
+                print(f"⏭️  {pid}: Already summarized, skipping")
+                continue
+
+            print(f"🔍 Triaging {pid}: {title[:60]}...")
+            try:
+                triage_result = triage_paper(title, abstract)
+                triaged_count += 1
+                total_triage_tokens += triage_result.get("tokens", 0) or 0
+
+                if not triage_result["relevant"]:
+                    print(f"   ⏭️  Skipped - Not relevant: {triage_result['reason']}")
+                    skipped_count += 1
+                    conn.execute(
+                        "UPDATE papers SET summary_md = ?, tldr = ? WHERE id = ?",
+                        ("[Skipped - Not relevant to reasoning]", triage_result["reason"], pid),
+                    )
+                    conn.commit()
+                    continue
+
+                print(f"   ✓ Relevant - {triage_result['reason'][:80]}")
+            except Exception as e:
+                print(f"   ⚠️  Triage failed: {e}, proceeding with full summary anyway")
+
+            prompt = PROMPT_TEMPLATE.format(**row)
+            try:
+                resp = call_llm(prompt)
+                md = (resp["text"] or "").strip()
+                tldr = extract_tldr(md)
+                save_summary(conn, pid, md, tldr, resp.get("model"), resp.get("tokens"))
+                summarized_count += 1
+                print(f"   ✅ Summarized ({len(md)} chars)\n")
+            except Exception as e:
+                print(f"   ❌ Summary failed: {e}\n")
+
+        print("\n" + "=" * 60)
+        print("📊 Pipeline Summary:")
+        print(f"   Papers triaged: {triaged_count}")
+        print(f"   Skipped (not relevant): {skipped_count}")
+        print(f"   Summarized: {summarized_count}")
+        if triaged_count > 0:
+            pass_rate = summarized_count / triaged_count * 100
+            print(f"   Pass rate: {pass_rate:.1f}%")
+        print(f"   Triage tokens used: {total_triage_tokens}")
+        if summarized_count > 0:
+            triage_cost = total_triage_tokens / 1_000_000 * 0.15  # gpt-4o-mini fallback
+            summary_cost = summarized_count * 0.04  # rough estimate
+            total_cost = triage_cost + summary_cost
+            print(f"   Estimated cost: ${total_cost:.2f}")
+        print("=" * 60)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

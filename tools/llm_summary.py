@@ -1,29 +1,13 @@
-import os, json
-try:
-    import requests
-except ImportError:  # optional dependency (needed for ollama)
-    requests = None
-try:
-    from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
-except ImportError:  # graceful fallback if tenacity is unavailable
-    def retry(*args, **kwargs):
-        def decorator(fn):
-            return fn
-        return decorator
+import os
 
-    def wait_exponential(*args, **kwargs):
-        return None
-
-    def stop_after_attempt(*args, **kwargs):
-        return None
-
-    def retry_if_exception_type(*args, **kwargs):
-        return None
+import requests
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 PROVIDER = os.getenv("SUMMARY_PROVIDER", "openai").lower()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 # Import OpenAI error types at module scope (safe even if provider != openai)
 try:
@@ -40,22 +24,21 @@ except Exception:
 )
 def call_llm(prompt: str):
     if PROVIDER == "openai":
-        if OpenAI is not None:
-            client = OpenAI()  # uses OPENAI_API_KEY from env
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a precise research summarizer."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-                max_tokens=2000,
-            )
-            text = resp.choices[0].message.content
-            total_tokens = resp.usage.total_tokens if resp.usage else None
-            return {"text": text, "tokens": total_tokens, "model": OPENAI_MODEL}
-        else:
-            return _call_openai_via_http(prompt)
+        if OpenAI is None:
+            raise RuntimeError("openai SDK not available - install openai package")
+        client = OpenAI()
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a precise research summarizer."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=2000,
+        )
+        text = resp.choices[0].message.content
+        total_tokens = resp.usage.total_tokens if resp.usage else None
+        return {"text": text, "tokens": total_tokens, "model": OPENAI_MODEL}
 
     elif PROVIDER == "anthropic":
         from anthropic import Anthropic
@@ -70,8 +53,6 @@ def call_llm(prompt: str):
         return {"text": text, "tokens": None, "model": ANTHROPIC_MODEL}
 
     elif PROVIDER == "ollama":
-        if requests is None:
-            raise RuntimeError("requests library is required for SUMMARY_PROVIDER=ollama")
         r = requests.post(
             "http://localhost:11434/api/chat",
             json={
@@ -91,45 +72,118 @@ def call_llm(prompt: str):
         raise RuntimeError(f"Unknown SUMMARY_PROVIDER: {PROVIDER}")
 
 
-def _call_openai_via_http(prompt: str):
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a precise research summarizer."},
-            {"role": "user", "content": prompt},
+def triage_paper(title: str, abstract: str) -> dict:
+    """
+    Stage A: Quick triage using Gemini Flash to determine if paper is worth full summary.
+    Returns: {"relevant": bool, "reason": str, "model": str, "tokens": int}
+    """
+
+    prompt = f"""
+You are filtering AI research papers for a reasoning-focused research hub.
+
+Determine if this paper is relevant to AI reasoning, agents, planning, or problem-solving.
+
+Title: {title}
+
+Abstract: {abstract}
+
+Output ONLY in this format:
+RELEVANT: YES or NO
+REASON: <one sentence explaining why>
+
+Be strict - only mark YES if the paper directly involves:
+- Reasoning capabilities in AI systems
+- Agent planning or decision-making
+- Problem-solving approaches
+- Chain-of-thought or multi-step reasoning
+- Benchmark evaluation of reasoning
+
+Mark NO if it's primarily about:
+- Pure computer vision without reasoning
+- Low-level optimization
+- Hardware/systems
+- Domain-specific applications without reasoning focus
+
+Be slightly permissive—err on the side of YES if uncertainty is high (we can down-score later).
+""".strip()
+
+    try:
+        import google.generativeai as genai
+
+        # Configure Gemini
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("GOOGLE_API_KEY not set")
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.1,
+                "max_output_tokens": 200,
+            }
+        )
+
+        text = response.text.strip()
+
+        # Parse response
+        relevant = "RELEVANT: YES" in text.upper()
+        reason_line = [line for line in text.split("\n") if "REASON:" in line.upper()]
+        reason = reason_line[0].split(":", 1)[1].strip() if reason_line else "No reason provided"
+
+        return {
+            "relevant": relevant,
+            "reason": reason,
+            "model": GEMINI_MODEL,
+            "tokens": 0  # Gemini free tier, effectively zero cost
+        }
+
+    except ImportError:
+        print("⚠️  google-generativeai not installed, falling back to OpenAI for triage")
+        return triage_with_openai(title, abstract)
+    except Exception as e:
+        print(f"⚠️  Gemini triage failed: {e}, falling back to OpenAI")
+        return triage_with_openai(title, abstract)
+
+
+def triage_with_openai(title: str, abstract: str) -> dict:
+    """Fallback triage using OpenAI if Gemini fails"""
+    from openai import OpenAI
+
+    client = OpenAI()
+
+    prompt = f"""
+Determine if this paper is relevant to AI reasoning.
+
+Title: {title}
+Abstract: {abstract}
+
+Output: RELEVANT: YES or NO
+REASON: <one sentence>
+
+Be slightly permissive—err on the side of YES if uncertainty is high.
+""".strip()
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",  # Cheap for triage
+        messages=[
+            {"role": "system", "content": "You are a research paper filter."},
+            {"role": "user", "content": prompt}
         ],
-        "temperature": 0.2,
-        "max_tokens": 2000,
+        temperature=0.1,
+        max_tokens=100,
+    )
+
+    text = resp.choices[0].message.content
+    relevant = "RELEVANT: YES" in text.upper()
+    reason_line = [line for line in text.split("\n") if "REASON:" in line.upper()]
+    reason = reason_line[0].split(":", 1)[1].strip() if reason_line else text
+
+    return {
+        "relevant": relevant,
+        "reason": reason,
+        "model": "gpt-4o-mini (fallback)",
+        "tokens": resp.usage.total_tokens if resp.usage else 0  # Track fallback cost
     }
-    if requests is not None:
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    else:
-        import urllib.request
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=120) as resp_handle:
-            body = resp_handle.read()
-            data = json.loads(body.decode("utf-8"))
-    choice = data.get("choices", [{}])[0]
-    message = choice.get("message", {})
-    text = message.get("content", "")
-    total_tokens = (data.get("usage") or {}).get("total_tokens")
-    return {"text": text, "tokens": total_tokens, "model": OPENAI_MODEL}
